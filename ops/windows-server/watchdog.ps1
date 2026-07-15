@@ -19,15 +19,9 @@ function Ensure-Backend {
     return
   }
   Write-WatchdogLog "Backend is down. Starting uvicorn on port $($Config.backend_port)."
-  $pythonArgs = @()
-  if ($Config.python_args_prefix) {
-    $pythonArgs += @($Config.python_args_prefix)
-  } elseif ([System.IO.Path]::GetFileName([string]$Config.python_cmd).ToLowerInvariant() -eq "py.exe") {
-    $pythonArgs += @("-3")
-  }
   Start-BackgroundProcess `
     -FilePath $Config.python_cmd `
-    -ArgumentList ($pythonArgs + @("-m", "uvicorn", "app:app", "--host", $Config.backend_host, "--port", [string]$Config.backend_port)) `
+    -ArgumentList @("-m", "uvicorn", "app:app", "--host", $Config.backend_host, "--port", [string]$Config.backend_port) `
     -WorkingDirectory $Config.backend_workdir `
     -StdOutPath (Join-Path $Config.log_dir "backend.out.log") `
     -StdErrPath (Join-Path $Config.log_dir "backend.err.log")
@@ -39,15 +33,9 @@ function Ensure-Workers {
     return
   }
   Write-WatchdogLog "Workers are down. Starting background workers."
-  $pythonArgs = @()
-  if ($Config.python_args_prefix) {
-    $pythonArgs += @($Config.python_args_prefix)
-  } elseif ([System.IO.Path]::GetFileName([string]$Config.python_cmd).ToLowerInvariant() -eq "py.exe") {
-    $pythonArgs += @("-3")
-  }
   Start-BackgroundProcess `
     -FilePath $Config.python_cmd `
-    -ArgumentList ($pythonArgs + @("-m", "workers")) `
+    -ArgumentList @("-m", "workers") `
     -WorkingDirectory $Config.backend_workdir `
     -StdOutPath (Join-Path $Config.log_dir "workers.out.log") `
     -StdErrPath (Join-Path $Config.log_dir "workers.err.log")
@@ -70,6 +58,10 @@ function Ensure-Frontend {
 
 $config = Load-ServiceConfig
 Ensure-Directory -Path $config.log_dir
+$projectPython = Resolve-ProjectPythonCommand
+if ($projectPython -and $projectPython -ne $config.python_cmd) {
+  $config.python_cmd = $projectPython
+}
 
 try {
   Write-WatchdogLog "Watchdog check started."

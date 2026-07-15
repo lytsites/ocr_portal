@@ -10,11 +10,26 @@ $logDir = Join-Path $repoRoot "backend\logs"
 $frontendWorkdir = Join-Path $repoRoot "apps\form-portal"
 $backendWorkdir = Join-Path $repoRoot "backend"
 $watchdogPath = Join-Path $PSScriptRoot "watchdog.ps1"
-$pythonCmd = Resolve-PythonCommand
-$pythonArgsPrefix = @()
-if ([System.IO.Path]::GetFileName($pythonCmd).ToLowerInvariant() -eq "py.exe") {
-  $pythonArgsPrefix = @("-3")
+$bootstrapPython = Resolve-PythonCommand
+$venvPython = Get-VenvPythonPath
+$venvDir = Split-Path -Parent (Split-Path -Parent $venvPython)
+
+if (-not (Test-Path -LiteralPath $venvPython)) {
+  Write-Host "[INFO] Creating project virtualenv at $venvDir"
+  $bootstrapArgs = @("-m", "venv", $venvDir)
+  if ([System.IO.Path]::GetFileName($bootstrapPython).ToLowerInvariant() -eq "py.exe") {
+    $bootstrapArgs = @("-3") + $bootstrapArgs
+  }
+  & $bootstrapPython @bootstrapArgs
 }
+
+if (-not (Test-Path -LiteralPath $venvPython)) {
+  throw "Failed to create virtualenv: $venvPython"
+}
+
+Write-Host "[INFO] Installing backend dependencies into project virtualenv"
+& $venvPython -m pip install --upgrade pip
+& $venvPython -m pip install -r (Join-Path $repoRoot "backend\requirements.txt")
 
 if (-not (Test-IsAdministrator)) {
   throw "Run this script as Administrator. Scheduled task registration for background startup needs elevated rights."
@@ -25,8 +40,7 @@ Ensure-Directory -Path $logDir
 
 $config = @{
   repo_root = $repoRoot
-  python_cmd = $pythonCmd
-  python_args_prefix = $pythonArgsPrefix
+  python_cmd = $venvPython
   npm_cmd = Resolve-CommandPath "npm.cmd"
   backend_host = "0.0.0.0"
   backend_port = 9000

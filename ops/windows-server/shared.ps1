@@ -42,6 +42,18 @@ function Resolve-PythonCommand {
   throw "Python executable not found in PATH."
 }
 
+function Get-VenvPythonPath {
+  return Join-Path (Get-RepoRoot) ".venv\Scripts\python.exe"
+}
+
+function Resolve-ProjectPythonCommand {
+  $venvPython = Get-VenvPythonPath
+  if (Test-Path -LiteralPath $venvPython) {
+    return $venvPython
+  }
+  return Resolve-PythonCommand
+}
+
 function Get-ConfigPath {
   return Join-Path (Get-RunRoot) "service-config.json"
 }
