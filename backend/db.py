@@ -126,7 +126,7 @@ class _MySQLConnection:
             if upper.startswith("SELECT") or upper.startswith("SHOW") or upper.startswith("DESCRIBE"):
                 rows = list(cursor.fetchall() or [])
                 return _MySQLQueryResult(rows, int(getattr(cursor, "rowcount", len(rows)) or len(rows)))
-            return _MySQLEmptyResult()
+            return _MySQLQueryResult([], int(getattr(cursor, "rowcount", 0) or 0))
 
     def close(self) -> None:
         self._conn.close()
@@ -145,7 +145,7 @@ def _connect_mysql() -> _MySQLConnection:
         password=MYSQL_PASSWORD,
         database=MYSQL_DATABASE,
         charset=MYSQL_CHARSET,
-        autocommit=False,
+        autocommit=True,
     )
     return _MySQLConnection(raw)
 
@@ -159,7 +159,7 @@ def _connect_mysql_admin() -> _MySQLConnection:
         user=MYSQL_USER,
         password=MYSQL_PASSWORD,
         charset=MYSQL_CHARSET,
-        autocommit=False,
+        autocommit=True,
     )
     return _MySQLConnection(raw)
 

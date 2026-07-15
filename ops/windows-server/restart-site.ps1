@@ -41,9 +41,13 @@ foreach ($process in $processes) {
 
 foreach ($processId in @($processIds)) {
   try {
-    Stop-Process -Id $processId -Force -ErrorAction Stop
+    & taskkill.exe /F /T /PID $processId 2>$null | Out-Null
   } catch {
-    continue
+    try {
+      Stop-Process -Id $processId -Force -ErrorAction Stop
+    } catch {
+      continue
+    }
   }
 }
 
