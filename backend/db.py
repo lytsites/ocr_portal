@@ -32,7 +32,9 @@ from settings import (
     MYSQL_USER,
     OWS_BASE_URL,
     OWS_TOKEN,
+    PROGRESS_MIN_STEP,
     ROOT_DIR,
+    STAGE_PROGRESS_MIN_INTERVAL_SEC,
 )
 from upload_modes import UPLOAD_MODE_DEFAULT, normalize_upload_mode
 
@@ -56,6 +58,8 @@ _OKED_MEMO: dict[str, tuple[str, str]] = {}
 OKED_CATALOG_PATH = ROOT_DIR / "docs" / "oked-catalog.json"
 DB_WRITE_RETRY_ATTEMPTS = 6
 DB_WRITE_RETRY_BASE_DELAY_SEC = 0.2
+DB_PROGRESS_MIN_STEP = int(PROGRESS_MIN_STEP)
+DB_PROGRESS_MIN_INTERVAL_SEC = float(STAGE_PROGRESS_MIN_INTERVAL_SEC)
 DB_ENGINE = str(DATABASE_ENGINE or "mysql").strip().lower()
 
 
@@ -995,13 +999,21 @@ def replace_report_552_facts(
             conn.execute("DELETE FROM report_552_facts WHERE doc_id=?", (doc_id,))
             total_rows = max(1, len(rows))
             last_emit_ts = 0.0
+            last_emit_processed = -1
             for i, row in enumerate(rows):
                 code_full = re.sub(r"\D+", "", str(row.get("code_full") or ""))
                 if len(code_full) != 9:
                     if progress_cb:
                         now_ts = time.time()
-                        if i == 0 or (now_ts - last_emit_ts) >= 0.75 or i + 1 >= total_rows:
+                        should_emit = (
+                            i == 0
+                            or i + 1 >= total_rows
+                            or ((i + 1) - last_emit_processed) >= DB_PROGRESS_MIN_STEP
+                            or (now_ts - last_emit_ts) >= DB_PROGRESS_MIN_INTERVAL_SEC
+                        )
+                        if should_emit:
                             last_emit_ts = now_ts
+                            last_emit_processed = i + 1
                             progress_cb(i + 1, total_rows, "rows")
                     continue
                 admin = code_full[:3]
@@ -1030,8 +1042,15 @@ def replace_report_552_facts(
                 )
                 if progress_cb:
                     now_ts = time.time()
-                    if i == 0 or (now_ts - last_emit_ts) >= 0.75 or i + 1 >= total_rows:
+                    should_emit = (
+                        i == 0
+                        or i + 1 >= total_rows
+                        or ((i + 1) - last_emit_processed) >= DB_PROGRESS_MIN_STEP
+                        or (now_ts - last_emit_ts) >= DB_PROGRESS_MIN_INTERVAL_SEC
+                    )
+                    if should_emit:
                         last_emit_ts = now_ts
+                        last_emit_processed = i + 1
                         progress_cb(i + 1, total_rows, "rows")
             conn.execute("COMMIT")
         except Exception:
