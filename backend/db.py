@@ -299,7 +299,7 @@ def _init_mysql_db(conn: Any) -> None:
           iin_bin VARCHAR(12),
           msb_segment VARCHAR(64) NOT NULL DEFAULT 'Не определено',
           oked_code VARCHAR(64) NOT NULL DEFAULT 'Не определено',
-          oked_name TEXT NOT NULL DEFAULT '',
+          oked_name TEXT NOT NULL,
           business_key VARCHAR(64) NOT NULL,
           raw_json LONGTEXT NOT NULL,
           created_at VARCHAR(32) NOT NULL,
@@ -337,7 +337,7 @@ def _init_mysql_db(conn: Any) -> None:
           iin_bin VARCHAR(12) PRIMARY KEY,
           segment VARCHAR(64) NOT NULL,
           checked_at VARCHAR(32) NOT NULL,
-          source_url TEXT NOT NULL DEFAULT ''
+          source_url TEXT NOT NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """
     )
@@ -346,9 +346,9 @@ def _init_mysql_db(conn: Any) -> None:
         CREATE TABLE IF NOT EXISTS goszakup_subject_cache (
           iin_bin VARCHAR(12) PRIMARY KEY,
           oked_code VARCHAR(64) NOT NULL,
-          oked_name TEXT NOT NULL DEFAULT '',
+          oked_name TEXT NOT NULL,
           checked_at VARCHAR(32) NOT NULL,
-          source_url TEXT NOT NULL DEFAULT ''
+          source_url TEXT NOT NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """
     )
