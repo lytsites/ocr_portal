@@ -12,7 +12,7 @@ import fitz
 from db import get_document, update_document_fields
 from db import replace_report_243_facts, replace_report_552_facts
 from form_specs import FORM_ENGINE_DEFAULT, get_form_spec, normalize_form_type
-from settings import DOCS_DIR, PROGRESS_MIN_INTERVAL_SEC, PROGRESS_MIN_STEP
+from settings import DOCS_DIR, PROGRESS_MIN_INTERVAL_SEC, PROGRESS_MIN_STEP, STAGE_PROGRESS_MIN_INTERVAL_SEC
 from upload_modes import UPLOAD_MODE_DEFAULT, UPLOAD_MODE_PDF_OCR, normalize_upload_mode
 
 
@@ -779,8 +779,9 @@ def process_document(doc_id: str) -> None:
             processing_processed=done_safe,
             processing_total=total_safe,
             processing_percent=min(100, percent),
-            pipeline_out=json.dumps(pipeline_info, ensure_ascii=False),
         )
+
+    last_sync_emit = {"processed": -1, "phase": "", "ts": 0.0}
 
     def sync_progress_cb(done: int, total: int, phase: str) -> None:
         done_safe = max(0, int(done))
@@ -796,6 +797,19 @@ def process_document(doc_id: str) -> None:
             stage_name = "syncing_facts_rows"
         else:
             stage_name = "syncing_facts"
+        now_ts = time.time()
+        should_emit = (
+            done_safe == 0
+            or done_safe >= total_safe
+            or phase_norm != str(last_sync_emit["phase"])
+            or (done_safe - int(last_sync_emit["processed"])) >= int(PROGRESS_MIN_STEP)
+            or (now_ts - float(last_sync_emit["ts"])) >= float(STAGE_PROGRESS_MIN_INTERVAL_SEC)
+        )
+        if not should_emit:
+            return
+        last_sync_emit["processed"] = done_safe
+        last_sync_emit["phase"] = phase_norm
+        last_sync_emit["ts"] = now_ts
         percent = int(round((done_safe * 100) / max(1, total_safe)))
         update_document_fields(
             doc_id,
@@ -804,14 +818,6 @@ def process_document(doc_id: str) -> None:
             processing_processed=done_safe,
             processing_total=total_safe,
             processing_percent=min(100, percent),
-            pipeline_out=json.dumps(
-                {
-                    **pipeline_info,
-                    "sync_phase": stage_name,
-                    "sync_progress": {"processed": done_safe, "total": total_safe, "percent": min(100, percent)},
-                },
-                ensure_ascii=False,
-            ),
         )
 
     payload = extract_table_from_pdf(input_path, form_type, progress_cb=progress_cb)
