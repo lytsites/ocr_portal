@@ -678,6 +678,7 @@ def process_document(doc_id: str) -> None:
             stats = payload.get("stats") or {}
             update_document_fields(
                 doc_id,
+                ignore_locked=True,
                 status="done",
                 stage="completed",
                 processing_status="done",
@@ -696,6 +697,7 @@ def process_document(doc_id: str) -> None:
 
     update_document_fields(
         doc_id,
+        ignore_locked=True,
         status="processing",
         stage="preparing_document",
         processing_status="processing",
@@ -719,6 +721,7 @@ def process_document(doc_id: str) -> None:
             percent = int(round((done_safe * 100) / total_safe))
             update_document_fields(
                 doc_id,
+                ignore_locked=True,
                 stage=f"rendering_pdf_pages {done_safe}/{total_safe}",
                 processing_processed=done_safe,
                 processing_total=total_safe,
@@ -747,6 +750,7 @@ def process_document(doc_id: str) -> None:
         }
         update_document_fields(
             doc_id,
+            ignore_locked=True,
             stage="ocr_pages_ready",
             pipeline_out=json.dumps(pipeline_info, ensure_ascii=False),
         )
@@ -770,6 +774,7 @@ def process_document(doc_id: str) -> None:
         percent = int(round((done_safe * 100) / max(1, total_safe)))
         update_document_fields(
             doc_id,
+            ignore_locked=True,
             stage=f"{'reading_pages_ocr_fallback' if upload_mode == UPLOAD_MODE_PDF_OCR else 'reading_pages'} {done_safe}/{total_safe}",
             processing_processed=done_safe,
             processing_total=total_safe,
@@ -794,6 +799,7 @@ def process_document(doc_id: str) -> None:
         percent = int(round((done_safe * 100) / max(1, total_safe)))
         update_document_fields(
             doc_id,
+            ignore_locked=True,
             stage=f"{stage_name} {done_safe}/{total_safe}",
             processing_processed=done_safe,
             processing_total=total_safe,

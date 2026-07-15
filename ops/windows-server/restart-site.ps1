@@ -50,11 +50,13 @@ foreach ($processId in @($processIds)) {
 Write-Host ("Stopped {0} process(es)." -f $processIds.Count)
 
 $deadline = (Get-Date).AddSeconds(20)
-while ((Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in $ports }).Count -gt 0) {
+$listening = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in $ports })
+while ($listening.Count -gt 0) {
   if ((Get-Date) -ge $deadline) {
     break
   }
   Start-Sleep -Milliseconds 500
+  $listening = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in $ports })
 }
 
 & "$PSScriptRoot\watchdog.ps1"

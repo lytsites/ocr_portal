@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import signal
 import time
+import traceback
 from multiprocessing import Process
 
 from db import (
@@ -32,6 +33,7 @@ def worker_loop(worker_id: str) -> None:
             mark_doc_finished_for_metrics(doc_id, include_pages=True)
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
+            traceback.print_exc()
             update_document_fields(
                 doc_id,
                 status="error",

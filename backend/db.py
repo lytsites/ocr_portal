@@ -35,10 +35,35 @@ OKED_UNKNOWN = "Не определено"
 OWS_SUBJECT_BIIN_URL = f"{OWS_BASE_URL}/v3/subject/biin/{{iin_bin}}"
 _OKED_MEMO: dict[str, tuple[str, str]] = {}
 OKED_CATALOG_PATH = ROOT_DIR / "docs" / "oked-catalog.json"
+SQLITE_WRITE_RETRY_ATTEMPTS = 6
+SQLITE_WRITE_RETRY_BASE_DELAY_SEC = 0.2
 
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _is_sqlite_locked_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return isinstance(exc, sqlite3.OperationalError) and "database is locked" in text
+
+
+def _run_sqlite_write_with_retry(fn: Callable[[], Any], *, attempts: int = SQLITE_WRITE_RETRY_ATTEMPTS) -> Any:
+    last_exc: Exception | None = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            last_exc = exc
+            if attempt + 1 >= max(1, int(attempts)):
+                break
+            delay = float(SQLITE_WRITE_RETRY_BASE_DELAY_SEC) * (2**attempt)
+            time.sleep(min(delay, 2.5))
+    if last_exc is not None:
+        raise last_exc
+    return None
 
 
 def get_conn() -> sqlite3.Connection:
@@ -346,7 +371,7 @@ def list_documents() -> list[dict[str, Any]]:
         conn.close()
 
 
-def update_document_fields(doc_id: str, **fields: Any) -> None:
+def update_document_fields(doc_id: str, *, ignore_locked: bool = False, **fields: Any) -> None:
     if not fields:
         return
     fields = dict(fields)
@@ -354,28 +379,39 @@ def update_document_fields(doc_id: str, **fields: Any) -> None:
     keys = list(fields.keys())
     sql = "UPDATE documents SET " + ", ".join(f"{k}=?" for k in keys) + " WHERE id=?"
     vals = [fields[k] for k in keys] + [doc_id]
-    conn = get_conn()
+    def _write() -> None:
+        conn = get_conn()
+        try:
+            conn.execute(sql, vals)
+        finally:
+            conn.close()
+
     try:
-        conn.execute(sql, vals)
-    finally:
-        conn.close()
+        _run_sqlite_write_with_retry(_write)
+    except Exception:
+        if ignore_locked:
+            return
+        raise
 
 
 def set_job_status(doc_id: str, *, status: str, worker_id: str | None = None, error: str | None = None) -> None:
-    conn = get_conn()
-    try:
-        if status == "processing":
-            conn.execute(
-                "UPDATE jobs SET status='processing', worker_id=?, started_at=?, attempts=attempts+1, error=NULL WHERE doc_id=?",
-                (worker_id, now_iso(), doc_id),
-            )
-        elif status in ("done", "error"):
-            conn.execute(
-                "UPDATE jobs SET status=?, finished_at=?, error=? WHERE doc_id=?",
-                (status, now_iso(), error, doc_id),
-            )
-    finally:
-        conn.close()
+    def _write() -> None:
+        conn = get_conn()
+        try:
+            if status == "processing":
+                conn.execute(
+                    "UPDATE jobs SET status='processing', worker_id=?, started_at=?, attempts=attempts+1, error=NULL WHERE doc_id=?",
+                    (worker_id, now_iso(), doc_id),
+                )
+            elif status in ("done", "error"):
+                conn.execute(
+                    "UPDATE jobs SET status=?, finished_at=?, error=? WHERE doc_id=?",
+                    (status, now_iso(), error, doc_id),
+                )
+        finally:
+            conn.close()
+
+    _run_sqlite_write_with_retry(_write)
 
 
 def claim_next_job(worker_id: str) -> dict[str, Any] | None:
@@ -663,106 +699,102 @@ def replace_report_243_facts(
     *,
     progress_cb: Callable[[int, int, str], None] | None = None,
 ) -> None:
-    conn = get_conn()
     now = now_iso()
-    try:
-        # Enrich unique taxpayers once per document to keep inserts fast.
-        iins: list[str] = []
-        fallback_abs_by_iin: dict[str, float] = {}
-        for row in rows:
-            iin_bin = _extract_iin_bin(str(row.get("iin_bin") or ""))
-            if not iin_bin:
-                continue
-            iins.append(iin_bin)
-            fallback_abs_by_iin[iin_bin] = float(fallback_abs_by_iin.get(iin_bin, 0.0) + abs(float(_parse_amount(row.get("amount")) or 0.0)))
-        unique_iins = list(dict.fromkeys(iins))
-        if progress_cb:
-            progress_cb(0, max(1, len(unique_iins) or len(rows) or 1), "cache")
-        _warm_msb_cache_for_keys(
-            unique_iins,
-            max_to_fetch=len(unique_iins),
-            progress_cb=(lambda done, total: progress_cb(done, total, "cache_msb")) if progress_cb else None,
-        )
-        _warm_oked_cache_for_keys(
-            unique_iins,
-            max_to_fetch=len(unique_iins),
-            progress_cb=(lambda done, total: progress_cb(done, total, "cache_oked")) if progress_cb else None,
-        )
-        enrichment_map: dict[str, dict[str, str]] = {}
-        for iin in unique_iins:
-            msb_segment = _resolve_taxpayer_msb_segment(
-                iin,
-                fallback_total_abs=float(fallback_abs_by_iin.get(iin, 0.0)),
-                allow_network=False,
-            )
-            oked_code, oked_name = _resolve_taxpayer_oked(iin, allow_network=False)
-            enrichment_map[iin] = {
-                "msb_segment": str(msb_segment or MSB_UNKNOWN),
-                "oked_code": str(oked_code or OKED_UNKNOWN),
-                "oked_name": str(oked_name or ""),
-            }
+    def _write() -> None:
+        conn = get_conn()
+        try:
+            # Keep the critical path short: use cache-only enrichment here and refresh
+            # MSB/OKED caches in the background after the document is already saved.
+            iins: list[str] = []
+            fallback_abs_by_iin: dict[str, float] = {}
+            for row in rows:
+                iin_bin = _extract_iin_bin(str(row.get("iin_bin") or ""))
+                if not iin_bin:
+                    continue
+                iins.append(iin_bin)
+                fallback_abs_by_iin[iin_bin] = float(fallback_abs_by_iin.get(iin_bin, 0.0) + abs(float(_parse_amount(row.get("amount")) or 0.0)))
+            unique_iins = list(dict.fromkeys(iins))
+            enrichment_map: dict[str, dict[str, str]] = {}
+            for iin in unique_iins:
+                msb_segment = _resolve_taxpayer_msb_segment(
+                    iin,
+                    fallback_total_abs=float(fallback_abs_by_iin.get(iin, 0.0)),
+                    allow_network=False,
+                )
+                oked_code, oked_name = _resolve_taxpayer_oked(iin, allow_network=False)
+                enrichment_map[iin] = {
+                    "msb_segment": str(msb_segment or MSB_UNKNOWN),
+                    "oked_code": str(oked_code or OKED_UNKNOWN),
+                    "oked_name": str(oked_name or ""),
+                }
 
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("DELETE FROM report_243_facts WHERE doc_id=?", (doc_id,))
-        total_rows = max(1, len(rows))
-        last_emit_ts = 0.0
-        for i, row in enumerate(rows):
-            kbk = str(row.get("kbk") or "").strip()
-            if not kbk:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM report_243_facts WHERE doc_id=?", (doc_id,))
+            total_rows = max(1, len(rows))
+            last_emit_ts = 0.0
+            for i, row in enumerate(rows):
+                kbk = str(row.get("kbk") or "").strip()
+                if not kbk:
+                    if progress_cb:
+                        now_ts = time.time()
+                        if i == 0 or (now_ts - last_emit_ts) >= 0.75 or i + 1 >= total_rows:
+                            last_emit_ts = now_ts
+                            progress_cb(i + 1, total_rows, "rows")
+                    continue
+                row_date_iso = _parse_date_iso(str(row.get("row_date") or ""))
+                amount = _parse_amount(row.get("amount"))
+                payment_no = str(row.get("payment_no") or "").strip()
+                iin_bin = _extract_iin_bin(str(row.get("iin_bin") or ""))
+                enriched = enrichment_map.get(iin_bin) or {"msb_segment": MSB_UNKNOWN, "oked_code": OKED_UNKNOWN, "oked_name": ""}
+                bkey_src = "|".join(
+                    [
+                        _norm_key_part(row_date_iso or row.get("row_date")),
+                        _norm_key_part(kbk),
+                        _norm_key_part(payment_no),
+                        _norm_key_part(iin_bin),
+                        _norm_key_part(amount),
+                    ]
+                )
+                business_key = hashlib.sha256(bkey_src.encode("utf-8")).hexdigest()
+                conn.execute(
+                    """
+                    INSERT INTO report_243_facts(
+                      doc_id,row_no,kbk,row_date_iso,amount,payment_no,iin_bin,msb_segment,oked_code,oked_name,business_key,raw_json,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        doc_id,
+                        i,
+                        kbk,
+                        row_date_iso,
+                        amount,
+                        payment_no,
+                        iin_bin,
+                        str(enriched.get("msb_segment") or MSB_UNKNOWN),
+                        str(enriched.get("oked_code") or OKED_UNKNOWN),
+                        str(enriched.get("oked_name") or ""),
+                        business_key,
+                        json.dumps(row, ensure_ascii=False),
+                        now,
+                    ),
+                )
                 if progress_cb:
                     now_ts = time.time()
                     if i == 0 or (now_ts - last_emit_ts) >= 0.75 or i + 1 >= total_rows:
                         last_emit_ts = now_ts
                         progress_cb(i + 1, total_rows, "rows")
-                continue
-            row_date_iso = _parse_date_iso(str(row.get("row_date") or ""))
-            amount = _parse_amount(row.get("amount"))
-            payment_no = str(row.get("payment_no") or "").strip()
-            iin_bin = _extract_iin_bin(str(row.get("iin_bin") or ""))
-            enriched = enrichment_map.get(iin_bin) or {"msb_segment": MSB_UNKNOWN, "oked_code": OKED_UNKNOWN, "oked_name": ""}
-            bkey_src = "|".join(
-                [
-                    _norm_key_part(row_date_iso or row.get("row_date")),
-                    _norm_key_part(kbk),
-                    _norm_key_part(payment_no),
-                    _norm_key_part(iin_bin),
-                    _norm_key_part(amount),
-                ]
-            )
-            business_key = hashlib.sha256(bkey_src.encode("utf-8")).hexdigest()
-            conn.execute(
-                """
-                INSERT INTO report_243_facts(
-                  doc_id,row_no,kbk,row_date_iso,amount,payment_no,iin_bin,msb_segment,oked_code,oked_name,business_key,raw_json,created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    doc_id,
-                    i,
-                    kbk,
-                    row_date_iso,
-                    amount,
-                    payment_no,
-                    iin_bin,
-                    str(enriched.get("msb_segment") or MSB_UNKNOWN),
-                    str(enriched.get("oked_code") or OKED_UNKNOWN),
-                    str(enriched.get("oked_name") or ""),
-                    business_key,
-                    json.dumps(row, ensure_ascii=False),
-                    now,
-                ),
-            )
-            if progress_cb:
-                now_ts = time.time()
-                if i == 0 or (now_ts - last_emit_ts) >= 0.75 or i + 1 >= total_rows:
-                    last_emit_ts = now_ts
-                    progress_cb(i + 1, total_rows, "rows")
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    finally:
-        conn.close()
+            conn.execute("COMMIT")
+            _start_report_243_enrichment_async(doc_id, unique_iins, fallback_abs_by_iin)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    _run_sqlite_write_with_retry(_write)
 
 
 def replace_report_552_facts(
@@ -771,57 +803,63 @@ def replace_report_552_facts(
     *,
     progress_cb: Callable[[int, int, str], None] | None = None,
 ) -> None:
-    conn = get_conn()
     now = now_iso()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("DELETE FROM report_552_facts WHERE doc_id=?", (doc_id,))
-        total_rows = max(1, len(rows))
-        last_emit_ts = 0.0
-        for i, row in enumerate(rows):
-            code_full = re.sub(r"\D+", "", str(row.get("code_full") or ""))
-            if len(code_full) != 9:
+    def _write() -> None:
+        conn = get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM report_552_facts WHERE doc_id=?", (doc_id,))
+            total_rows = max(1, len(rows))
+            last_emit_ts = 0.0
+            for i, row in enumerate(rows):
+                code_full = re.sub(r"\D+", "", str(row.get("code_full") or ""))
+                if len(code_full) != 9:
+                    if progress_cb:
+                        now_ts = time.time()
+                        if i == 0 or (now_ts - last_emit_ts) >= 0.75 or i + 1 >= total_rows:
+                            last_emit_ts = now_ts
+                            progress_cb(i + 1, total_rows, "rows")
+                    continue
+                admin = code_full[:3]
+                program = code_full[3:6]
+                subprogram = code_full[6:9]
+                conn.execute(
+                    """
+                    INSERT INTO report_552_facts(
+                      doc_id,row_no,fund,code_full,administrator,program,subprogram,specific,expense_period,expense_ytd,raw_json,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        doc_id,
+                        i,
+                        str(row.get("fund") or "").strip(),
+                        code_full,
+                        admin,
+                        program,
+                        subprogram,
+                        str(row.get("specific") or "").strip(),
+                        _parse_amount(row.get("expense_period")),
+                        _parse_amount(row.get("expense_ytd")),
+                        json.dumps(row, ensure_ascii=False),
+                        now,
+                    ),
+                )
                 if progress_cb:
                     now_ts = time.time()
                     if i == 0 or (now_ts - last_emit_ts) >= 0.75 or i + 1 >= total_rows:
                         last_emit_ts = now_ts
                         progress_cb(i + 1, total_rows, "rows")
-                continue
-            admin = code_full[:3]
-            program = code_full[3:6]
-            subprogram = code_full[6:9]
-            conn.execute(
-                """
-                INSERT INTO report_552_facts(
-                  doc_id,row_no,fund,code_full,administrator,program,subprogram,specific,expense_period,expense_ytd,raw_json,created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    doc_id,
-                    i,
-                    str(row.get("fund") or "").strip(),
-                    code_full,
-                    admin,
-                    program,
-                    subprogram,
-                    str(row.get("specific") or "").strip(),
-                    _parse_amount(row.get("expense_period")),
-                    _parse_amount(row.get("expense_ytd")),
-                    json.dumps(row, ensure_ascii=False),
-                    now,
-                ),
-            )
-            if progress_cb:
-                now_ts = time.time()
-                if i == 0 or (now_ts - last_emit_ts) >= 0.75 or i + 1 >= total_rows:
-                    last_emit_ts = now_ts
-                    progress_cb(i + 1, total_rows, "rows")
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    finally:
-        conn.close()
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    _run_sqlite_write_with_retry(_write)
 
 
 def get_report_243(*, kbk: str, date_from: str | None = None, date_to: str | None = None) -> dict[str, Any]:
@@ -1222,21 +1260,24 @@ def _load_msb_cached(iin_bin: str) -> str | None:
 def _save_msb_cached(iin_bin: str, segment: str, source_url: str) -> None:
     if not iin_bin or segment not in MSB_SEGMENTS:
         return
-    conn = get_conn()
-    try:
-        conn.execute(
-            """
-            INSERT INTO msb_registry_cache(iin_bin, segment, checked_at, source_url)
-            VALUES(?,?,?,?)
-            ON CONFLICT(iin_bin) DO UPDATE SET
-              segment=excluded.segment,
-              checked_at=excluded.checked_at,
-              source_url=excluded.source_url
-            """,
-            (iin_bin, segment, now_iso(), str(source_url or "")),
-        )
-    finally:
-        conn.close()
+    def _write() -> None:
+        conn = get_conn()
+        try:
+            conn.execute(
+                """
+                INSERT INTO msb_registry_cache(iin_bin, segment, checked_at, source_url)
+                VALUES(?,?,?,?)
+                ON CONFLICT(iin_bin) DO UPDATE SET
+                  segment=excluded.segment,
+                  checked_at=excluded.checked_at,
+                  source_url=excluded.source_url
+                """,
+                (iin_bin, segment, now_iso(), str(source_url or "")),
+            )
+        finally:
+            conn.close()
+
+    _run_sqlite_write_with_retry(_write)
 
 
 def _load_oked_cached(iin_bin: str) -> tuple[str, str] | None:
@@ -1262,22 +1303,25 @@ def _save_oked_cached(iin_bin: str, oked_code: str, oked_name: str, source_url: 
         return
     code = str(oked_code or "").strip() or OKED_UNKNOWN
     name = str(oked_name or "").strip()
-    conn = get_conn()
-    try:
-        conn.execute(
-            """
-            INSERT INTO goszakup_subject_cache(iin_bin, oked_code, oked_name, checked_at, source_url)
-            VALUES(?,?,?,?,?)
-            ON CONFLICT(iin_bin) DO UPDATE SET
-              oked_code=excluded.oked_code,
-              oked_name=excluded.oked_name,
-              checked_at=excluded.checked_at,
-              source_url=excluded.source_url
-            """,
-            (iin_bin, code, name, now_iso(), str(source_url or "")),
-        )
-    finally:
-        conn.close()
+    def _write() -> None:
+        conn = get_conn()
+        try:
+            conn.execute(
+                """
+                INSERT INTO goszakup_subject_cache(iin_bin, oked_code, oked_name, checked_at, source_url)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(iin_bin) DO UPDATE SET
+                  oked_code=excluded.oked_code,
+                  oked_name=excluded.oked_name,
+                  checked_at=excluded.checked_at,
+                  source_url=excluded.source_url
+                """,
+                (iin_bin, code, name, now_iso(), str(source_url or "")),
+            )
+        finally:
+            conn.close()
+
+    _run_sqlite_write_with_retry(_write)
 
 
 def _extract_single_oked_entry(item: Any) -> tuple[str, str]:
@@ -1504,6 +1548,72 @@ def _start_msb_warmup_async(iin_keys: list[str]) -> None:
                 _MSB_WARMUP_STARTED = False
 
     t = threading.Thread(target=_worker, name="msb-cache-warmup", daemon=True)
+    t.start()
+
+
+def _start_report_243_enrichment_async(doc_id: str, iin_keys: list[str], fallback_abs_by_iin: dict[str, float]) -> None:
+    unique_keys = list(dict.fromkeys([_normalize_iin_bin(k) for k in iin_keys if _normalize_iin_bin(k)]))
+    if not unique_keys:
+        return
+
+    def _worker() -> None:
+        try:
+            _warm_msb_cache_for_keys(unique_keys, max_to_fetch=len(unique_keys))
+            _warm_oked_cache_for_keys(unique_keys, max_to_fetch=len(unique_keys))
+
+            conn = get_conn()
+            try:
+                rows = conn.execute(
+                    "SELECT row_no, iin_bin, amount FROM report_243_facts WHERE doc_id=?",
+                    (doc_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+
+            if not rows:
+                return
+
+            conn = get_conn()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for r in rows:
+                    row_no = int(r["row_no"] or 0)
+                    iin_bin = _normalize_iin_bin(str(r["iin_bin"] or ""))
+                    fallback_total_abs = float(fallback_abs_by_iin.get(iin_bin, 0.0))
+                    msb_segment = _resolve_taxpayer_msb_segment(
+                        iin_bin,
+                        fallback_total_abs=fallback_total_abs,
+                        allow_network=False,
+                    )
+                    oked_code, oked_name = _resolve_taxpayer_oked(iin_bin, allow_network=False)
+                    conn.execute(
+                        """
+                        UPDATE report_243_facts
+                        SET msb_segment=?, oked_code=?, oked_name=?
+                        WHERE doc_id=? AND row_no=?
+                        """,
+                        (
+                            str(msb_segment or MSB_UNKNOWN),
+                            str(oked_code or OKED_UNKNOWN),
+                            str(oked_name or ""),
+                            doc_id,
+                            row_no,
+                        ),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            finally:
+                conn.close()
+        except Exception:
+            # Background enrichment is best-effort only.
+            return
+
+    t = threading.Thread(target=_worker, name=f"report-243-enrich-{doc_id}", daemon=True)
     t.start()
 
 
