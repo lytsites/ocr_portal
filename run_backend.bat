@@ -29,7 +29,7 @@ if %errorlevel%==0 (
 
 echo [INFO] Starting backend on %BACKEND_HOST%:%BACKEND_PORT% ...
 echo [INFO] Expected public API: https://api.e-qoldau.asia
-py -3 -m uvicorn app:app --host %BACKEND_HOST% --port %BACKEND_PORT%
+python -m uvicorn app:app --host %BACKEND_HOST% --port %BACKEND_PORT%
 
 if errorlevel 1 (
   echo [ERROR] Backend exited with error code %errorlevel%.

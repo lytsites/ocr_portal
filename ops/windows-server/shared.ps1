@@ -22,6 +22,26 @@ function Resolve-CommandPath {
   return $cmd.Source
 }
 
+function Resolve-PythonCommand {
+  foreach ($candidate in @("python.exe", "python", "py")) {
+    try {
+      $cmd = Get-Command $candidate -ErrorAction Stop
+      if ($cmd.Source) {
+        return $cmd.Source
+      }
+      if ($cmd.Path) {
+        return $cmd.Path
+      }
+      if ($cmd.Name) {
+        return $cmd.Name
+      }
+    } catch {
+      continue
+    }
+  }
+  throw "Python executable not found in PATH."
+}
+
 function Get-ConfigPath {
   return Join-Path (Get-RunRoot) "service-config.json"
 }

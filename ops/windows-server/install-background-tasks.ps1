@@ -10,6 +10,11 @@ $logDir = Join-Path $repoRoot "backend\logs"
 $frontendWorkdir = Join-Path $repoRoot "apps\form-portal"
 $backendWorkdir = Join-Path $repoRoot "backend"
 $watchdogPath = Join-Path $PSScriptRoot "watchdog.ps1"
+$pythonCmd = Resolve-PythonCommand
+$pythonArgsPrefix = @()
+if ([System.IO.Path]::GetFileName($pythonCmd).ToLowerInvariant() -eq "py.exe") {
+  $pythonArgsPrefix = @("-3")
+}
 
 if (-not (Test-IsAdministrator)) {
   throw "Run this script as Administrator. Scheduled task registration for background startup needs elevated rights."
@@ -20,7 +25,8 @@ Ensure-Directory -Path $logDir
 
 $config = @{
   repo_root = $repoRoot
-  py_cmd = Resolve-CommandPath "py"
+  python_cmd = $pythonCmd
+  python_args_prefix = $pythonArgsPrefix
   npm_cmd = Resolve-CommandPath "npm.cmd"
   backend_host = "0.0.0.0"
   backend_port = 9000
