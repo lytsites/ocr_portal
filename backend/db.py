@@ -322,7 +322,7 @@ def _init_mysql_db(conn: Any) -> None:
           administrator TEXT,
           program TEXT,
           subprogram TEXT,
-          specific TEXT,
+          `specific` TEXT,
           expense_period DOUBLE,
           expense_ytd DOUBLE,
           raw_json LONGTEXT NOT NULL,
@@ -1010,7 +1010,7 @@ def replace_report_552_facts(
                 conn.execute(
                     """
                     INSERT INTO report_552_facts(
-                      doc_id,row_no,fund,code_full,administrator,program,subprogram,specific,expense_period,expense_ytd,raw_json,created_at
+                      doc_id,row_no,fund,code_full,administrator,program,subprogram,`specific`,expense_period,expense_ytd,raw_json,created_at
                     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
@@ -1191,7 +1191,7 @@ def get_report_latest(*, form_type: str) -> dict[str, Any]:
         if form_norm == "form_5_52":
             rows = conn.execute(
                 """
-                SELECT row_no,fund,code_full,administrator,program,subprogram,specific,expense_period,expense_ytd,raw_json
+                SELECT row_no,fund,code_full,administrator,program,subprogram,`specific`,expense_period,expense_ytd,raw_json
                 FROM report_552_facts
                 WHERE doc_id=?
                 ORDER BY row_no ASC
