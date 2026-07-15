@@ -87,7 +87,14 @@ for _env_path in (
 
 DATA_DIR = BASE_DIR / "data"
 DOCS_DIR = DATA_DIR / "documents"
-DB_PATH = DATA_DIR / "portal.db"
+DATABASE_ENGINE = env_str("DATABASE_ENGINE", "mysql").strip().lower()
+MYSQL_HOST = env_str("MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = env_int("MYSQL_PORT", 3306, min_value=1)
+MYSQL_USER = env_str("MYSQL_USER", "root")
+MYSQL_PASSWORD = env_str("MYSQL_PASSWORD", "root")
+MYSQL_DATABASE = env_str("MYSQL_DATABASE", "ocr_portal")
+MYSQL_CHARSET = env_str("MYSQL_CHARSET", "utf8mb4")
+DOCUMENT_DELETE_ENABLED = env_bool("DOCUMENT_DELETE_ENABLED", False)
 PUBLIC_WEB_ORIGIN = env_str("PUBLIC_WEB_ORIGIN", "https://docs.e-qoldau.asia").rstrip("/")
 PUBLIC_API_ORIGIN = env_str("PUBLIC_API_ORIGIN", "https://api.e-qoldau.asia").rstrip("/")
 BACKEND_HOST = env_str("BACKEND_HOST", "0.0.0.0")

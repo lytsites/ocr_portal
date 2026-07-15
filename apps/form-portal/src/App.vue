@@ -61,12 +61,12 @@
                 <th>Этап обработки</th>
                 <th>Прогресс этапа</th>
                 <th>Очередь</th>
-                <th>Карточка</th>
+                <th>Действия</th>
               </tr>
             </thead>
             <tbody>
-              <tr v-if="documentsError"><td colspan="9" class="muted">Ошибка загрузки реестра: {{ documentsError }}</td></tr>
-              <tr v-else-if="documents.length === 0"><td colspan="9" class="muted">Документы пока не загружены.</td></tr>
+              <tr v-if="documentsError"><td colspan="10" class="muted">Ошибка загрузки реестра: {{ documentsError }}</td></tr>
+              <tr v-else-if="documents.length === 0"><td colspan="10" class="muted">Документы пока не загружены.</td></tr>
               <tr v-for="d in documents" :key="d.id">
                 <td><code>{{ d.id }}</code></td>
                 <td>
@@ -83,10 +83,20 @@
                   <div class="muted">{{ processed(d) }} / {{ total(d) }} ({{ progressPercent(d) }}%)</div>
                 </td>
                 <td>{{ queueText(d.queue) }}</td>
-                <td><button class="btn" @click="openDocument(d.id)">Открыть</button></td>
+                <td style="display:flex;gap:8px;flex-wrap:wrap">
+                  <button class="btn" @click="openDocument(d.id)">Открыть</button>
+                  <button
+                    v-if="documentDeleteEnabled"
+                    class="btn danger"
+                    :disabled="isDeleteLocked(d)"
+                    @click="confirmDeleteDocument(d)"
+                  >
+                    Удалить
+                  </button>
+                </td>
               </tr>
               <tr v-if="pipelineMetrics.enabled && pipelineMetrics.summary_text">
-                <td colspan="9" class="muted">Итог прогона очереди: {{ pipelineMetrics.summary_text }}</td>
+                <td colspan="10" class="muted">Итог прогона очереди: {{ pipelineMetrics.summary_text }}</td>
               </tr>
             </tbody>
           </table>
@@ -339,6 +349,7 @@ const formsCatalog = ref([{ id: FORM_ID, title: FORM_LABEL }]);
 const documents = ref([]);
 const documentsError = ref("");
 const pipelineMetrics = ref({ enabled: false, summary_text: "" });
+const appConfig = ref({ document_delete_enabled: false });
 const selectedDocumentId = ref("");
 const selectedDocument = ref(null);
 const selectedDocumentTable = ref({ ready: false, headers: [], rows: [], row_indent_levels: [] });
@@ -356,6 +367,7 @@ const analyticsUrl = ANALYTICS_URL;
 const currentFormPath = buildFormPath(PROFILE.slug);
 const isAnalyticsRoute = ROUTE.type === "analytics";
 const siteLinks = computed(() => (isAnalyticsRoute ? SITE_LINKS : SITE_LINKS.filter((x) => x.label !== FORM_LABEL)));
+const documentDeleteEnabled = computed(() => !!appConfig.value.document_delete_enabled);
 
 function makeId() {
   return `${Date.now()}_${Math.random()}`;
@@ -877,6 +889,13 @@ async function apiPostForm(path, formData) {
   return data;
 }
 
+async function apiDelete(path) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "DELETE" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || "Request failed");
+  return data;
+}
+
 function resetUpload() {
   uploadFiles.value.forEach((f) => URL.revokeObjectURL(f.url));
   uploadFiles.value = [];
@@ -1039,6 +1058,17 @@ async function loadUploadModes() {
   }
 }
 
+async function loadAppConfig() {
+  try {
+    const out = await apiGet("/api/config");
+    appConfig.value = {
+      document_delete_enabled: !!out?.document_delete_enabled,
+    };
+  } catch (_e) {
+    appConfig.value = { document_delete_enabled: false };
+  }
+}
+
 async function loadDocument() {
   if (!selectedDocumentId.value) return;
   try {
@@ -1071,6 +1101,29 @@ function openDocument(id) {
   activeTab.value = "document";
   loadDocument();
   docTimer = setInterval(loadDocument, 3000);
+}
+
+function isDeleteLocked(doc) {
+  const status = String(doc?.status || "").toLowerCase();
+  return status === "queued" || status === "processing";
+}
+
+async function confirmDeleteDocument(doc) {
+  if (!documentDeleteEnabled.value) return;
+  if (!doc?.id) return;
+  if (isDeleteLocked(doc)) return;
+  const label = `${doc.name || doc.id} (${doc.id})`;
+  if (!window.confirm(`Удалить документ ${label} из базы и файлов? Это действие нельзя отменить.`)) return;
+  try {
+    await apiDelete(`/api/documents/${encodeURIComponent(doc.id)}`);
+    if (selectedDocumentId.value === doc.id) {
+      resetDocumentCardState({ clearSelection: true });
+      activeTab.value = "documents";
+    }
+    await loadDocuments();
+  } catch (e) {
+    alert(e.message || "Не удалось удалить документ");
+  }
 }
 
 function resetDocumentCardState(opts = {}) {
@@ -1109,8 +1162,7 @@ watch(
 onMounted(() => {
   document.addEventListener("click", onDocumentClick);
   if (isAnalyticsRoute) return;
-  loadUploadModes();
-  loadDocuments();
+  Promise.allSettled([loadUploadModes(), loadDocuments(), loadAppConfig()]);
   docsTimer = setInterval(loadDocuments, 3000);
 });
 

@@ -153,7 +153,7 @@ backend/data/       => будущее data/
 - `backend/domains/analytics/`:
   логика аналитики поверх фактов.
 - `backend/repositories/`:
-  работа с SQLite и таблицами.
+  работа с MySQL и таблицами.
 - `backend/config/`:
   настройки и окружение.
 

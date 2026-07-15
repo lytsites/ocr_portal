@@ -5,8 +5,8 @@ import functools
 import json
 import re
 import time
-import sqlite3
 import threading
+import shutil
 import urllib.parse
 import urllib.request
 from html import unescape
@@ -14,7 +14,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from settings import BATCH_TIMER_ENABLED, DATA_DIR, DB_PATH, DOCS_DIR, OWS_BASE_URL, OWS_TOKEN, ROOT_DIR
+try:
+    import pymysql
+except Exception:  # pragma: no cover - optional dependency for MySQL mode
+    pymysql = None
+
+from settings import (
+    BATCH_TIMER_ENABLED,
+    DATA_DIR,
+    DOCS_DIR,
+    DATABASE_ENGINE,
+    MYSQL_CHARSET,
+    MYSQL_DATABASE,
+    MYSQL_HOST,
+    MYSQL_PASSWORD,
+    MYSQL_PORT,
+    MYSQL_USER,
+    OWS_BASE_URL,
+    OWS_TOKEN,
+    ROOT_DIR,
+)
 from upload_modes import UPLOAD_MODE_DEFAULT, normalize_upload_mode
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -35,218 +54,308 @@ OKED_UNKNOWN = "Не определено"
 OWS_SUBJECT_BIIN_URL = f"{OWS_BASE_URL}/v3/subject/biin/{{iin_bin}}"
 _OKED_MEMO: dict[str, tuple[str, str]] = {}
 OKED_CATALOG_PATH = ROOT_DIR / "docs" / "oked-catalog.json"
-SQLITE_WRITE_RETRY_ATTEMPTS = 6
-SQLITE_WRITE_RETRY_BASE_DELAY_SEC = 0.2
+DB_WRITE_RETRY_ATTEMPTS = 6
+DB_WRITE_RETRY_BASE_DELAY_SEC = 0.2
+DB_ENGINE = str(DATABASE_ENGINE or "mysql").strip().lower()
 
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def _is_sqlite_locked_error(exc: Exception) -> bool:
+class _MySQLQueryResult:
+    def __init__(self, rows: list[dict[str, Any]], rowcount: int):
+        self._rows = rows
+        self._rowcount = int(rowcount or 0)
+        self._iter_idx = 0
+
+    def fetchone(self) -> dict[str, Any] | None:
+        if self._iter_idx >= len(self._rows):
+            return None
+        row = self._rows[self._iter_idx]
+        self._iter_idx += 1
+        return dict(row)
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        if self._iter_idx >= len(self._rows):
+            return []
+        out = [dict(r) for r in self._rows[self._iter_idx :]]
+        self._iter_idx = len(self._rows)
+        return out
+
+    @property
+    def rowcount(self) -> int:
+        return self._rowcount
+
+
+class _MySQLEmptyResult:
+    rowcount = 0
+
+    def fetchone(self) -> None:
+        return None
+
+    def fetchall(self) -> list[Any]:
+        return []
+
+
+class _MySQLConnection:
+    def __init__(self, conn: Any):
+        self._conn = conn
+
+    def execute(self, sql: str, params: Any | None = None):
+        norm = str(sql or "").strip()
+        upper = norm.upper()
+        if upper.startswith("PRAGMA"):
+            return _MySQLEmptyResult()
+        if upper.startswith("COMMIT"):
+            self._conn.commit()
+            return _MySQLEmptyResult()
+        if upper.startswith("ROLLBACK"):
+            self._conn.rollback()
+            return _MySQLEmptyResult()
+        if upper.startswith("BEGIN"):
+            with self._conn.cursor() as cursor:
+                cursor.execute("START TRANSACTION")
+            return _MySQLEmptyResult()
+
+        sql2 = str(sql or "")
+        sql2 = re.sub(r"INSERT\s+OR\s+REPLACE\s+INTO", "REPLACE INTO", sql2, flags=re.IGNORECASE)
+        sql2 = sql2.replace("?", "%s")
+        with self._conn.cursor(pymysql.cursors.DictCursor if pymysql else None) as cursor:
+            cursor.execute(sql2, params or ())
+            if upper.startswith("SELECT") or upper.startswith("SHOW") or upper.startswith("DESCRIBE"):
+                rows = list(cursor.fetchall() or [])
+                return _MySQLQueryResult(rows, int(getattr(cursor, "rowcount", len(rows)) or len(rows)))
+            return _MySQLEmptyResult()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+def _connect_mysql() -> _MySQLConnection:
+    if pymysql is None:
+        raise RuntimeError("PyMySQL is required for DATABASE_ENGINE=mysql. Install backend/requirements.txt.")
+    raw = pymysql.connect(
+        host=MYSQL_HOST,
+        port=int(MYSQL_PORT),
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE,
+        charset=MYSQL_CHARSET,
+        autocommit=False,
+    )
+    return _MySQLConnection(raw)
+
+
+def _is_db_locked_error(exc: Exception) -> bool:
     text = str(exc).lower()
-    return isinstance(exc, sqlite3.OperationalError) and "database is locked" in text
+    return any(
+        key in text
+        for key in (
+            "lock wait timeout",
+            "deadlock",
+            "is locked",
+            "can't connect to mysql server during query",
+            "server has gone away",
+        )
+    )
 
 
-def _run_sqlite_write_with_retry(fn: Callable[[], Any], *, attempts: int = SQLITE_WRITE_RETRY_ATTEMPTS) -> Any:
+def _run_db_write_with_retry(fn: Callable[[], Any], *, attempts: int = DB_WRITE_RETRY_ATTEMPTS) -> Any:
     last_exc: Exception | None = None
     for attempt in range(max(1, int(attempts))):
         try:
             return fn()
         except Exception as exc:
-            if not _is_sqlite_locked_error(exc):
+            if not _is_db_locked_error(exc):
                 raise
             last_exc = exc
             if attempt + 1 >= max(1, int(attempts)):
                 break
-            delay = float(SQLITE_WRITE_RETRY_BASE_DELAY_SEC) * (2**attempt)
+            delay = float(DB_WRITE_RETRY_BASE_DELAY_SEC) * (2**attempt)
             time.sleep(min(delay, 2.5))
     if last_exc is not None:
         raise last_exc
     return None
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), timeout=30.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    return conn
+def get_conn() -> Any:
+    if DB_ENGINE != "mysql":
+        raise RuntimeError("Only MySQL is supported now. Set DATABASE_ENGINE=mysql and install PyMySQL.")
+    return _connect_mysql()
+
+
+def _init_mysql_db(conn: Any) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS documents (
+          id VARCHAR(64) PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          form_type VARCHAR(32) NOT NULL DEFAULT 'form_2_43',
+          upload_mode VARCHAR(32) NOT NULL DEFAULT 'pdf_text',
+          dpi INT NOT NULL DEFAULT 300,
+          created_at VARCHAR(32) NOT NULL,
+          updated_at VARCHAR(32) NOT NULL,
+          status VARCHAR(32) NOT NULL,
+          stage VARCHAR(128) NOT NULL,
+          file_size_bytes BIGINT NOT NULL DEFAULT 0,
+          file_path TEXT NOT NULL,
+          header_fingerprint VARCHAR(128) NOT NULL,
+          duplicate_of VARCHAR(64) NOT NULL DEFAULT '',
+          processing_status VARCHAR(32) NOT NULL DEFAULT 'queued',
+          processing_started_at VARCHAR(32),
+          processing_finished_at VARCHAR(32),
+          processing_processed INT NOT NULL DEFAULT 0,
+          processing_total INT NOT NULL DEFAULT 0,
+          processing_percent INT NOT NULL DEFAULT 0,
+          processing_error TEXT,
+          processing_stats_json LONGTEXT,
+          pipeline_out LONGTEXT,
+          cells_dir TEXT,
+          pages_total INT NOT NULL DEFAULT 0,
+          metric_cycle_id INT,
+          metric_counted INT NOT NULL DEFAULT 0,
+          INDEX idx_docs_created (created_at),
+          INDEX idx_docs_status (status),
+          INDEX idx_docs_metric_cycle (metric_cycle_id, status)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS jobs (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          doc_id VARCHAR(64) NOT NULL UNIQUE,
+          priority INT NOT NULL,
+          status VARCHAR(32) NOT NULL,
+          worker_id VARCHAR(64),
+          attempts INT NOT NULL DEFAULT 0,
+          created_at VARCHAR(32) NOT NULL,
+          started_at VARCHAR(32),
+          finished_at VARCHAR(32),
+          error LONGTEXT,
+          INDEX idx_jobs_status_priority (status, priority, id),
+          CONSTRAINT fk_jobs_doc FOREIGN KEY (doc_id) REFERENCES documents(id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fingerprints (
+          header_fingerprint VARCHAR(128) PRIMARY KEY,
+          doc_id VARCHAR(64) NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS queue_metrics (
+          id INT PRIMARY KEY,
+          current_cycle_id INT NOT NULL DEFAULT 0,
+          active INT NOT NULL DEFAULT 0,
+          started_at VARCHAR(32),
+          finished_at VARCHAR(32),
+          pages_total INT NOT NULL DEFAULT 0,
+          docs_total INT NOT NULL DEFAULT 0
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS report_243_facts (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          doc_id VARCHAR(64) NOT NULL,
+          row_no INT NOT NULL,
+          kbk VARCHAR(32) NOT NULL,
+          row_date_iso VARCHAR(32),
+          amount DOUBLE,
+          payment_no TEXT,
+          iin_bin VARCHAR(12),
+          msb_segment VARCHAR(64) NOT NULL DEFAULT 'Не определено',
+          oked_code VARCHAR(64) NOT NULL DEFAULT 'Не определено',
+          oked_name TEXT NOT NULL DEFAULT '',
+          business_key VARCHAR(64) NOT NULL,
+          raw_json LONGTEXT NOT NULL,
+          created_at VARCHAR(32) NOT NULL,
+          INDEX idx_243_doc (doc_id, row_no),
+          INDEX idx_243_kbk_date (kbk, row_date_iso),
+          INDEX idx_243_bkey (business_key),
+          INDEX idx_243_msb (msb_segment),
+          INDEX idx_243_oked (oked_code)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS report_552_facts (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          doc_id VARCHAR(64) NOT NULL,
+          row_no INT NOT NULL,
+          fund TEXT,
+          code_full VARCHAR(32),
+          administrator TEXT,
+          program TEXT,
+          subprogram TEXT,
+          specific TEXT,
+          expense_period DOUBLE,
+          expense_ytd DOUBLE,
+          raw_json LONGTEXT NOT NULL,
+          created_at VARCHAR(32) NOT NULL,
+          INDEX idx_552_doc (doc_id, row_no)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS msb_registry_cache (
+          iin_bin VARCHAR(12) PRIMARY KEY,
+          segment VARCHAR(64) NOT NULL,
+          checked_at VARCHAR(32) NOT NULL,
+          source_url TEXT NOT NULL DEFAULT ''
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS goszakup_subject_cache (
+          iin_bin VARCHAR(12) PRIMARY KEY,
+          oked_code VARCHAR(64) NOT NULL,
+          oked_name TEXT NOT NULL DEFAULT '',
+          checked_at VARCHAR(32) NOT NULL,
+          source_url TEXT NOT NULL DEFAULT ''
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    _ensure_metrics_row(conn)
 
 
 def init_db() -> None:
     conn = get_conn()
     try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS documents (
-              id TEXT PRIMARY KEY,
-              name TEXT NOT NULL,
-              form_type TEXT NOT NULL DEFAULT 'form_2_43',
-              upload_mode TEXT NOT NULL DEFAULT 'pdf_text',
-              dpi INTEGER NOT NULL DEFAULT 300,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              status TEXT NOT NULL,
-              stage TEXT NOT NULL,
-              file_size_bytes INTEGER NOT NULL DEFAULT 0,
-              file_path TEXT NOT NULL,
-              header_fingerprint TEXT NOT NULL,
-              duplicate_of TEXT NOT NULL DEFAULT '',
-              processing_status TEXT NOT NULL DEFAULT 'queued',
-              processing_started_at TEXT,
-              processing_finished_at TEXT,
-              processing_processed INTEGER NOT NULL DEFAULT 0,
-              processing_total INTEGER NOT NULL DEFAULT 0,
-              processing_percent INTEGER NOT NULL DEFAULT 0,
-              processing_error TEXT,
-              processing_stats_json TEXT,
-              pipeline_out TEXT,
-              cells_dir TEXT,
-              pages_total INTEGER NOT NULL DEFAULT 0,
-              metric_cycle_id INTEGER,
-              metric_counted INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS jobs (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              doc_id TEXT NOT NULL UNIQUE,
-              priority INTEGER NOT NULL,
-              status TEXT NOT NULL,
-              worker_id TEXT,
-              attempts INTEGER NOT NULL DEFAULT 0,
-              created_at TEXT NOT NULL,
-              started_at TEXT,
-              finished_at TEXT,
-              error TEXT,
-              FOREIGN KEY(doc_id) REFERENCES documents(id)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS fingerprints (
-              header_fingerprint TEXT PRIMARY KEY,
-              doc_id TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS queue_metrics (
-              id INTEGER PRIMARY KEY CHECK (id = 1),
-              current_cycle_id INTEGER NOT NULL DEFAULT 0,
-              active INTEGER NOT NULL DEFAULT 0,
-              started_at TEXT,
-              finished_at TEXT,
-              pages_total INTEGER NOT NULL DEFAULT 0,
-              docs_total INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS report_243_facts (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              doc_id TEXT NOT NULL,
-              row_no INTEGER NOT NULL,
-              kbk TEXT NOT NULL,
-              row_date_iso TEXT,
-              amount REAL,
-              payment_no TEXT,
-              iin_bin TEXT,
-              business_key TEXT NOT NULL,
-              raw_json TEXT NOT NULL,
-              created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS report_552_facts (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              doc_id TEXT NOT NULL,
-              row_no INTEGER NOT NULL,
-              fund TEXT,
-              code_full TEXT,
-              administrator TEXT,
-              program TEXT,
-              subprogram TEXT,
-              specific TEXT,
-              expense_period REAL,
-              expense_ytd REAL,
-              raw_json TEXT NOT NULL,
-              created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS msb_registry_cache (
-              iin_bin TEXT PRIMARY KEY,
-              segment TEXT NOT NULL,
-              checked_at TEXT NOT NULL,
-              source_url TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS goszakup_subject_cache (
-              iin_bin TEXT PRIMARY KEY,
-              oked_code TEXT NOT NULL,
-              oked_name TEXT NOT NULL DEFAULT '',
-              checked_at TEXT NOT NULL,
-              source_url TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        _ensure_column(conn, "documents", "pages_total", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(conn, "documents", "metric_cycle_id", "INTEGER")
-        _ensure_column(conn, "documents", "metric_counted", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(conn, "documents", "form_type", "TEXT NOT NULL DEFAULT 'form_2_43'")
-        _ensure_column(conn, "documents", "upload_mode", f"TEXT NOT NULL DEFAULT '{UPLOAD_MODE_DEFAULT}'")
-        _ensure_column(conn, "documents", "processing_status", "TEXT NOT NULL DEFAULT 'queued'")
-        _ensure_column(conn, "documents", "processing_started_at", "TEXT")
-        _ensure_column(conn, "documents", "processing_finished_at", "TEXT")
-        _ensure_column(conn, "documents", "processing_processed", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(conn, "documents", "processing_total", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(conn, "documents", "processing_percent", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(conn, "documents", "processing_error", "TEXT")
-        _ensure_column(conn, "documents", "processing_stats_json", "TEXT")
-        _ensure_column(conn, "report_243_facts", "msb_segment", "TEXT NOT NULL DEFAULT 'Не определено'")
-        _ensure_column(conn, "report_243_facts", "oked_code", "TEXT NOT NULL DEFAULT 'Не определено'")
-        _ensure_column(conn, "report_243_facts", "oked_name", "TEXT NOT NULL DEFAULT ''")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_priority ON jobs(status, priority, id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_docs_created ON documents(created_at DESC)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_docs_status ON documents(status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_docs_metric_cycle ON documents(metric_cycle_id, status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_243_doc ON report_243_facts(doc_id, row_no)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_243_kbk_date ON report_243_facts(kbk, row_date_iso)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_243_bkey ON report_243_facts(business_key)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_243_msb ON report_243_facts(msb_segment)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_243_oked ON report_243_facts(oked_code)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_552_doc ON report_552_facts(doc_id, row_no)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_msb_checked ON msb_registry_cache(checked_at DESC)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_subject_checked ON goszakup_subject_cache(checked_at DESC)")
-        _ensure_metrics_row(conn)
+        _init_mysql_db(conn)
     finally:
         conn.close()
 
 
-def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
-    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    cols = {str(r["name"]) for r in rows}
+def _ensure_column(conn: Any, table: str, column: str, ddl: str) -> None:
+    rows = conn.execute(
+        """
+        SELECT COLUMN_NAME AS name
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND COLUMN_NAME=%s
+        """,
+        (MYSQL_DATABASE, table, column),
+    ).fetchall()
+    cols = {str(r.get("name") if isinstance(r, dict) else r["name"]) for r in rows}
     if column in cols:
         return
     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
-def _ensure_metrics_row(conn: sqlite3.Connection) -> sqlite3.Row:
+def _ensure_metrics_row(conn: Any) -> dict[str, Any]:
     row = conn.execute("SELECT * FROM queue_metrics WHERE id=1").fetchone()
     if row is not None:
         return row
@@ -259,17 +368,21 @@ def _ensure_metrics_row(conn: sqlite3.Connection) -> sqlite3.Row:
     return conn.execute("SELECT * FROM queue_metrics WHERE id=1").fetchone()
 
 
-def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+def row_to_dict(row: Any | None) -> dict[str, Any] | None:
     if row is None:
         return None
-    return {k: row[k] for k in row.keys()}
+    if isinstance(row, dict):
+        return dict(row)
+    if hasattr(row, "keys"):
+        return {k: row[k] for k in row.keys()}
+    return dict(row)
 
 
 def create_document(*, payload: dict[str, Any], queue: bool) -> None:
     now = now_iso()
     conn = get_conn()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("START TRANSACTION")
         conn.execute(
             """
             INSERT INTO documents (
@@ -310,7 +423,7 @@ def create_document(*, payload: dict[str, Any], queue: bool) -> None:
         )
         if payload.get("header_fingerprint") and not payload.get("duplicate_of"):
             conn.execute(
-                "INSERT OR REPLACE INTO fingerprints(header_fingerprint, doc_id) VALUES(?,?)",
+                "REPLACE INTO fingerprints(header_fingerprint, doc_id) VALUES(?,?)",
                 (payload["header_fingerprint"], payload["id"]),
             )
         if queue:
@@ -371,6 +484,53 @@ def list_documents() -> list[dict[str, Any]]:
         conn.close()
 
 
+def delete_document(doc_id: str) -> dict[str, Any]:
+    doc = get_document(doc_id)
+    if not doc:
+        return {"deleted": False, "reason": "not_found"}
+
+    status = str(doc.get("status") or "").strip().lower()
+    if status in {"queued", "processing"}:
+        raise RuntimeError("cannot_delete_processing_document")
+
+    header_fp = str(doc.get("header_fingerprint") or "").strip()
+    doc_root = DOCS_DIR / doc_id
+    file_path = Path(str(doc.get("file_path") or "")).resolve(strict=False)
+
+    conn = get_conn()
+    try:
+        conn.execute("START TRANSACTION")
+        conn.execute("DELETE FROM jobs WHERE doc_id=?", (doc_id,))
+        conn.execute("DELETE FROM report_243_facts WHERE doc_id=?", (doc_id,))
+        conn.execute("DELETE FROM report_552_facts WHERE doc_id=?", (doc_id,))
+        if header_fp:
+            owner = conn.execute("SELECT doc_id FROM fingerprints WHERE header_fingerprint=?", (header_fp,)).fetchone()
+            if owner and str(owner["doc_id"] or "") == doc_id:
+                conn.execute("DELETE FROM fingerprints WHERE header_fingerprint=?", (header_fp,))
+        conn.execute("DELETE FROM documents WHERE id=?", (doc_id,))
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+    try:
+        if file_path.exists():
+            file_path.unlink()
+    except Exception:
+        pass
+    try:
+        if doc_root.exists():
+            shutil.rmtree(doc_root, ignore_errors=True)
+    except Exception:
+        pass
+    return {"deleted": True, "id": doc_id}
+
+
 def update_document_fields(doc_id: str, *, ignore_locked: bool = False, **fields: Any) -> None:
     if not fields:
         return
@@ -387,7 +547,7 @@ def update_document_fields(doc_id: str, *, ignore_locked: bool = False, **fields
             conn.close()
 
     try:
-        _run_sqlite_write_with_retry(_write)
+        _run_db_write_with_retry(_write)
     except Exception:
         if ignore_locked:
             return
@@ -411,13 +571,13 @@ def set_job_status(doc_id: str, *, status: str, worker_id: str | None = None, er
         finally:
             conn.close()
 
-    _run_sqlite_write_with_retry(_write)
+    _run_db_write_with_retry(_write)
 
 
 def claim_next_job(worker_id: str) -> dict[str, Any] | None:
     conn = get_conn()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("START TRANSACTION")
         row = conn.execute(
             """
             SELECT id, doc_id, priority
@@ -501,7 +661,7 @@ def mark_doc_processing_start(doc_id: str) -> None:
         return
     conn = get_conn()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("START TRANSACTION")
         m = _ensure_metrics_row(conn)
         cycle_id = int(m["current_cycle_id"] or 0)
         if int(m["active"] or 0) != 1:
@@ -536,7 +696,7 @@ def mark_doc_finished_for_metrics(doc_id: str, *, include_pages: bool) -> None:
         return
     conn = get_conn()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("START TRANSACTION")
         m = _ensure_metrics_row(conn)
         current_cycle_id = int(m["current_cycle_id"] or 0)
         doc = conn.execute(
@@ -728,7 +888,7 @@ def replace_report_243_facts(
                     "oked_name": str(oked_name or ""),
                 }
 
-            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("START TRANSACTION")
             conn.execute("DELETE FROM report_243_facts WHERE doc_id=?", (doc_id,))
             total_rows = max(1, len(rows))
             last_emit_ts = 0.0
@@ -794,7 +954,7 @@ def replace_report_243_facts(
         finally:
             conn.close()
 
-    _run_sqlite_write_with_retry(_write)
+    _run_db_write_with_retry(_write)
 
 
 def replace_report_552_facts(
@@ -807,7 +967,7 @@ def replace_report_552_facts(
     def _write() -> None:
         conn = get_conn()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("START TRANSACTION")
             conn.execute("DELETE FROM report_552_facts WHERE doc_id=?", (doc_id,))
             total_rows = max(1, len(rows))
             last_emit_ts = 0.0
@@ -859,7 +1019,7 @@ def replace_report_552_facts(
         finally:
             conn.close()
 
-    _run_sqlite_write_with_retry(_write)
+    _run_db_write_with_retry(_write)
 
 
 def get_report_243(*, kbk: str, date_from: str | None = None, date_to: str | None = None) -> dict[str, Any]:
@@ -1003,7 +1163,7 @@ def get_report_latest(*, form_type: str) -> dict[str, Any]:
         if not d:
             return {"document": None, "items": []}
 
-        rows: list[sqlite3.Row] = []
+        rows: list[dict[str, Any]] = []
         if form_norm == "form_5_52":
             rows = conn.execute(
                 """
@@ -1267,17 +1427,17 @@ def _save_msb_cached(iin_bin: str, segment: str, source_url: str) -> None:
                 """
                 INSERT INTO msb_registry_cache(iin_bin, segment, checked_at, source_url)
                 VALUES(?,?,?,?)
-                ON CONFLICT(iin_bin) DO UPDATE SET
-                  segment=excluded.segment,
-                  checked_at=excluded.checked_at,
-                  source_url=excluded.source_url
+                ON DUPLICATE KEY UPDATE
+                  segment=VALUES(segment),
+                  checked_at=VALUES(checked_at),
+                  source_url=VALUES(source_url)
                 """,
                 (iin_bin, segment, now_iso(), str(source_url or "")),
             )
         finally:
             conn.close()
 
-    _run_sqlite_write_with_retry(_write)
+    _run_db_write_with_retry(_write)
 
 
 def _load_oked_cached(iin_bin: str) -> tuple[str, str] | None:
@@ -1310,18 +1470,18 @@ def _save_oked_cached(iin_bin: str, oked_code: str, oked_name: str, source_url: 
                 """
                 INSERT INTO goszakup_subject_cache(iin_bin, oked_code, oked_name, checked_at, source_url)
                 VALUES(?,?,?,?,?)
-                ON CONFLICT(iin_bin) DO UPDATE SET
-                  oked_code=excluded.oked_code,
-                  oked_name=excluded.oked_name,
-                  checked_at=excluded.checked_at,
-                  source_url=excluded.source_url
+                ON DUPLICATE KEY UPDATE
+                  oked_code=VALUES(oked_code),
+                  oked_name=VALUES(oked_name),
+                  checked_at=VALUES(checked_at),
+                  source_url=VALUES(source_url)
                 """,
                 (iin_bin, code, name, now_iso(), str(source_url or "")),
             )
         finally:
             conn.close()
 
-    _run_sqlite_write_with_retry(_write)
+    _run_db_write_with_retry(_write)
 
 
 def _extract_single_oked_entry(item: Any) -> tuple[str, str]:
@@ -1575,7 +1735,7 @@ def _start_report_243_enrichment_async(doc_id: str, iin_keys: list[str], fallbac
 
             conn = get_conn()
             try:
-                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("START TRANSACTION")
                 for r in rows:
                     row_no = int(r["row_no"] or 0)
                     iin_bin = _normalize_iin_bin(str(r["iin_bin"] or ""))

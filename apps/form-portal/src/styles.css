@@ -206,6 +206,18 @@ body {
   box-shadow: 0 6px 14px var(--accent-soft-16);
 }
 
+.btn.danger {
+  border-color: color-mix(in srgb, #dc2626 24%, var(--line));
+  color: #b91c1c;
+  background: color-mix(in srgb, #dc2626 8%, #fff);
+}
+
+.btn.danger:not(:disabled):hover {
+  color: #991b1b;
+  border-color: color-mix(in srgb, #dc2626 40%, var(--line));
+  background: color-mix(in srgb, #dc2626 14%, #fff);
+}
+
 .btn:disabled {
   opacity: 0.55;
   cursor: not-allowed;

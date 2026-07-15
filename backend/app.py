@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 
 from db import (
     create_document,
+    delete_document,
     find_duplicate_doc_id,
     get_analytics_243_filters,
     get_analytics_243_overview,
@@ -29,7 +30,7 @@ from db import (
 from form_specs import FORM_ENGINE_DEFAULT, FORM_ENGINE_IDS, get_form_spec, list_forms, normalize_form_type
 from ocr_engines import get_ocr_capabilities
 from processor import doc_dir, extract_form_meta_from_pdf, extract_header_fingerprint
-from settings import CORS_ALLOW_ORIGIN_REGEX, CORS_ORIGINS, ROOT_DIR
+from settings import CORS_ALLOW_ORIGIN_REGEX, CORS_ORIGINS, DOCUMENT_DELETE_ENABLED, ROOT_DIR
 from upload_modes import UPLOAD_MODE_DEFAULT, UPLOAD_MODE_IDS, list_upload_modes, normalize_upload_mode
 
 app = FastAPI(title="PDF Portal Backend", version="0.3.0")
@@ -129,6 +130,11 @@ def api_ocr_capabilities() -> dict[str, Any]:
 @app.get("/api/upload-modes")
 def api_upload_modes() -> dict[str, Any]:
     return {"default": UPLOAD_MODE_DEFAULT, "items": list_upload_modes()}
+
+
+@app.get("/api/config")
+def api_config() -> dict[str, Any]:
+    return {"document_delete_enabled": bool(DOCUMENT_DELETE_ENABLED)}
 
 
 @app.get("/api/metrics/pipeline")
@@ -305,6 +311,22 @@ def api_document_preview(doc_id: str):
         raise HTTPException(status_code=404, detail="file not found")
     safe_name = _safe_name(str(d.get("name") or "document.pdf"))
     return FileResponse(path, media_type="application/pdf", filename=safe_name, headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/api/documents/{doc_id}")
+def api_document_delete(doc_id: str) -> dict[str, Any]:
+    if not bool(DOCUMENT_DELETE_ENABLED):
+        raise HTTPException(status_code=403, detail="document delete is disabled")
+    d = get_document(doc_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="document not found")
+    status = str(d.get("status") or "").strip().lower()
+    if status in {"queued", "processing"}:
+        raise HTTPException(status_code=409, detail="document is still processing")
+    try:
+        return delete_document(doc_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/api/documents/{doc_id}/table")
