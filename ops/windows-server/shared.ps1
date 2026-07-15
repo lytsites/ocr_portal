@@ -23,23 +23,70 @@ function Resolve-CommandPath {
 }
 
 function Resolve-PythonCommand {
-  foreach ($candidate in @("python.exe", "python", "py")) {
+  $candidatePaths = New-Object System.Collections.Generic.List[string]
+
+  foreach ($candidate in @("python.exe", "python")) {
     try {
       $cmd = Get-Command $candidate -ErrorAction Stop
       if ($cmd.Source) {
-        return $cmd.Source
+        $candidatePaths.Add($cmd.Source)
+        continue
       }
       if ($cmd.Path) {
-        return $cmd.Path
+        $candidatePaths.Add($cmd.Path)
+        continue
       }
       if ($cmd.Name) {
-        return $cmd.Name
+        $candidatePaths.Add($cmd.Name)
+        continue
       }
     } catch {
       continue
     }
   }
-  throw "Python executable not found in PATH."
+
+  $probeRoots = @(
+    (Join-Path $env:LocalAppData "Programs\Python"),
+    (Join-Path $env:ProgramFiles "Python"),
+    (Join-Path ${env:ProgramFiles(x86)} "Python")
+  ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+
+  foreach ($root in $probeRoots) {
+    try {
+      $found = Get-ChildItem -Path (Join-Path $root "Python*\python.exe") -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending
+      foreach ($item in $found) {
+        $candidatePaths.Add($item.FullName)
+      }
+    } catch {
+      continue
+    }
+  }
+
+  try {
+    $pyCmd = Get-Command "py" -ErrorAction SilentlyContinue
+    if ($pyCmd) {
+      $pyOut = & $pyCmd.Source -0p 2>$null
+      if ($LASTEXITCODE -eq 0 -and $pyOut) {
+        foreach ($line in @($pyOut)) {
+          if ($line -match '^\s*-\s*([A-Za-z]:\\.+?python(?:w)?\.exe)\s*$') {
+            $candidatePaths.Add($Matches[1])
+          }
+        }
+        $candidatePaths.Add($pyCmd.Source)
+      }
+    }
+  } catch {
+    # Ignore launcher probing failures and keep looking for a direct executable.
+  }
+
+  foreach ($path in $candidatePaths) {
+    if ($path -and (Test-Path -LiteralPath $path)) {
+      return $path
+    }
+  }
+
+  throw "Python executable not found. Install Python 3.x or add it to PATH."
 }
 
 function Get-VenvPythonPath {
