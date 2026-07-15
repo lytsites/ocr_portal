@@ -1,0 +1,13 @@
+# Optional OCR engines for scanned PDFs.
+# Install only one stack first; they are intentionally not part of the base backend.
+
+# PaddleOCR stack
+# Choose a matching paddlepaddle CPU/GPU build for your machine first.
+paddleocr
+
+# Surya stack
+surya-ocr
+torch
+
+# docTR stack
+python-doctr
