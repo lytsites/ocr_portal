@@ -1105,7 +1105,7 @@ function openDocument(id) {
 
 function isDeleteLocked(doc) {
   const status = String(doc?.status || "").toLowerCase();
-  return status === "queued" || status === "processing";
+  return status === "processing";
 }
 
 async function confirmDeleteDocument(doc) {

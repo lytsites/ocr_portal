@@ -321,7 +321,7 @@ def api_document_delete(doc_id: str) -> dict[str, Any]:
     if not d:
         raise HTTPException(status_code=404, detail="document not found")
     status = str(d.get("status") or "").strip().lower()
-    if status in {"queued", "processing"}:
+    if status == "processing":
         raise HTTPException(status_code=409, detail="document is still processing")
     try:
         return delete_document(doc_id)

@@ -207,15 +207,17 @@ body {
 }
 
 .btn.danger {
-  border-color: color-mix(in srgb, #dc2626 24%, var(--line));
-  color: #b91c1c;
-  background: color-mix(in srgb, #dc2626 8%, #fff);
+  border-color: #b24a43;
+  color: #fff;
+  background: linear-gradient(180deg, #d0655d, #b4453d);
+  box-shadow: 0 8px 20px rgba(180, 69, 61, 0.22);
 }
 
 .btn.danger:not(:disabled):hover {
-  color: #991b1b;
-  border-color: color-mix(in srgb, #dc2626 40%, var(--line));
-  background: color-mix(in srgb, #dc2626 14%, #fff);
+  color: #fff;
+  border-color: #9f3f39;
+  background: linear-gradient(180deg, #c95b53, #9f3f39);
+  box-shadow: 0 6px 14px rgba(159, 63, 57, 0.18);
 }
 
 .btn:disabled {

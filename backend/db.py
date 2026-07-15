@@ -514,7 +514,7 @@ def delete_document(doc_id: str) -> dict[str, Any]:
         return {"deleted": False, "reason": "not_found"}
 
     status = str(doc.get("status") or "").strip().lower()
-    if status in {"queued", "processing"}:
+    if status == "processing":
         raise RuntimeError("cannot_delete_processing_document")
 
     header_fp = str(doc.get("header_fingerprint") or "").strip()
