@@ -33,6 +33,7 @@ let viewer = null;
 let loadingTask = null;
 let pdfDoc = null;
 let viewerModule = null;
+let loadSeq = 0;
 
 function applySearch() {
   if (!eventBus) return;
@@ -52,6 +53,7 @@ function applySearch() {
 async function loadPdf() {
   const src = String(props.src || "").trim();
   if (!viewer || !findController) return;
+  const seq = ++loadSeq;
 
   if (loadingTask) {
     try { loadingTask.destroy(); } catch (_e) {}
@@ -69,10 +71,25 @@ async function loadPdf() {
   }
 
   loadingTask = pdfjsLib.getDocument(src);
-  pdfDoc = await loadingTask.promise;
-  viewer.setDocument(pdfDoc);
-  linkService.setDocument(pdfDoc, null);
-  applySearch();
+  try {
+    const nextDoc = await loadingTask.promise;
+    if (seq !== loadSeq) {
+      try { nextDoc.destroy(); } catch (_e) {}
+      return;
+    }
+    pdfDoc = nextDoc;
+    viewer.setDocument(pdfDoc);
+    linkService.setDocument(pdfDoc, null);
+    applySearch();
+  } catch (err) {
+    if (seq !== loadSeq) return;
+    try { viewer.setDocument(null); } catch (_e) {}
+    try { linkService.setDocument(null); } catch (_e) {}
+    if (String(err?.message || "").toLowerCase().includes("worker was terminated")) {
+      return;
+    }
+    throw err;
+  }
 }
 
 async function initViewer() {
@@ -106,6 +123,7 @@ watch(() => props.query, () => {
 });
 
 onBeforeUnmount(() => {
+  loadSeq += 1;
   if (loadingTask) {
     try { loadingTask.destroy(); } catch (_e) {}
     loadingTask = null;
