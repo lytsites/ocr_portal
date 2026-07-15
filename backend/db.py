@@ -150,6 +150,29 @@ def _connect_mysql() -> _MySQLConnection:
     return _MySQLConnection(raw)
 
 
+def _connect_mysql_admin() -> _MySQLConnection:
+    if pymysql is None:
+        raise RuntimeError("PyMySQL is required for DATABASE_ENGINE=mysql. Install backend/requirements.txt.")
+    raw = pymysql.connect(
+        host=MYSQL_HOST,
+        port=int(MYSQL_PORT),
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        charset=MYSQL_CHARSET,
+        autocommit=False,
+    )
+    return _MySQLConnection(raw)
+
+
+def _ensure_mysql_database_exists() -> None:
+    conn = _connect_mysql_admin()
+    try:
+        conn.execute(f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DATABASE}` CHARACTER SET {MYSQL_CHARSET}")
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
 def _is_db_locked_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return any(
@@ -333,6 +356,7 @@ def _init_mysql_db(conn: Any) -> None:
 
 
 def init_db() -> None:
+    _ensure_mysql_database_exists()
     conn = get_conn()
     try:
         _init_mysql_db(conn)
